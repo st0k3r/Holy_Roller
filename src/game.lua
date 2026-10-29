@@ -19,7 +19,11 @@ local BRAKE = 0.06
 local DRIVE_TIME = 180   -- frames spent cruising between waves
 
 local CAR_SPR = 1
-local CAR_TRANS = 14     -- pink is the transparent colour in the car sprite (it's mostly black)
+local ZOMBIE_SPR = 2     -- first walk frame, drawn facing left
+local WALK_FRAMES = 3  -- walk frames are ZOMBIE_SPR .. ZOMBIE_SPR+WALK_FRAMES-1
+local WALK_FRAME_T = 20 -- frames each walk frame is held for
+local STEP_PUSH = {1.4, 0.8, 0.8}  -- per walk frame: a big lurch on the step, weaker drag after (averages 1)
+local TRANS_COL = 14     -- pink is the transparent colour in the sprites (they use a lot of black)
 
 local STEER_SPEED = 2.5  -- sideways speed when steering between waves
 local ROADKILL_SCORE = 25
@@ -30,6 +34,7 @@ local state         -- "title", "play", "over"
 local phase, phase_t, wave, to_spawn
 local banner, banner_t
 local car, car_img, gunner
+local zw, zh            -- zombie sprite size
 local zombies, road_zs, bullets, parts
 local scroll, speed, score, kills, spawn_t, road_t, shake
 
@@ -57,6 +62,8 @@ function _init()
 	state = "title"
 	-- road state lives outside reset_game so starting a run doesn't jolt the car
 	scroll, speed = 0, CRUISE_SPEED
+	local zs = get_spr(ZOMBIE_SPR)
+	zw, zh = zs:width(), zs:height()
 	reset_game()
 end
 
@@ -95,10 +102,10 @@ end
 local function spawn_zombie()
 	local side = rnd(1) < 0.5 and -1 or 1
 	add(zombies, {
-		x = side < 0 and -8 or SW+8,
+		x = side < 0 and -zw/2 or SW+zw/2,
 		y = 10 + rnd(SH-20),
 		side = side,
-		spd = 0.35 + rnd(0.3) + min(wave * 0.08, 0.6),
+		spd = 0.25 + rnd(0.25) + min(wave * 0.06, 0.45),
 		hp = 2,
 		hit_t = 0,
 		wob = rnd(1),
@@ -109,10 +116,24 @@ end
 local function spawn_road_zombie()
 	add(road_zs, {
 		x = ROAD_X0 + 8 + rnd(ROAD_W - 16),
-		y = -12,
+		y = -zh/2,
 		hit_t = 0,
 		wob = rnd(1),
 	})
+end
+
+-- which walk frame a zombie is on, and how far through it (0..1).
+-- wob ticks up 0.05 a frame, so it doubles as the walk-cycle clock
+local function walk_phase(z)
+	local f = z.wob * 20 / WALK_FRAME_T
+	return flr(f) % WALK_FRAMES, f % 1
+end
+
+-- speed multiplier synced to the walk cycle: each frame surges from a standstill
+-- and settles back to one, so zombies only move while their legs do
+local function shamble(z)
+	local frame, t = walk_phase(z)
+	return STEP_PUSH[frame + 1] * (1 - cos(t))
 end
 
 -- update -------------------------------------------------------------------
@@ -185,7 +206,7 @@ local function splatter(hx, hy)
 			for px=flr(cx-r),flr(cx+r) do
 				if px >= 0 and py >= 0 and px < car.w and py < car.h
 				and (px-cx)^2 + (py-cy)^2 <= r*r
-				and car_img:get(px, py) ~= CAR_TRANS then
+				and car_img:get(px, py) ~= TRANS_COL then
 					car_img:set(px, py, col)
 				end
 			end
@@ -213,8 +234,9 @@ local function update_road_zombies()
 	for i=#road_zs,1,-1 do
 		local z = road_zs[i]
 		-- the road carries them toward the car; they shuffle toward it a little too
-		z.y += speed + 0.3
-		z.x += sgn(car.x - z.x) * 0.2
+		local step = shamble(z)
+		z.y += speed + 0.22 * step
+		z.x += sgn(car.x - z.x) * 0.15 * step
 		z.wob += 0.05
 
 		if abs(z.x - car.x) < car.w/2 + 3 and abs(z.y - car.y) < car.h/2 + 3 then
@@ -225,7 +247,7 @@ local function update_road_zombies()
 			burst(z.x, z.y, 20, {8, 2, 3, 11}, 3)
 			splatter(z.x - (car.x - car.w/2), z.y - (car.y - car.h/2))
 			deli(road_zs, i)
-		elseif z.y > SH + 12 then
+		elseif z.y > SH + zh then
 			deli(road_zs, i)
 		end
 	end
@@ -281,7 +303,7 @@ local function update_play()
 		local dead = b.life <= 0 or b.x < -10 or b.x > SW+10 or b.y < -10 or b.y > SH+10
 		if not dead then
 			for z in all(zombies) do
-				if abs(b.x - z.x) < 6 and abs(b.y - z.y) < 8 then
+				if abs(b.x - z.x) < zw/2 and abs(b.y - z.y) < zh/2 then
 					z.hp -= 1
 					z.hit_t = 4
 					z.x += b.vx * 0.6  -- knockback
@@ -307,8 +329,9 @@ local function update_play()
 			deli(zombies, i)
 		else
 			local dx, dy = norm(car.x - z.x, car.y - z.y)
-			z.x += dx * z.spd
-			z.y += dy * z.spd
+			local step = shamble(z)
+			z.x += dx * z.spd * step
+			z.y += dy * z.spd * step
 			z.wob += 0.05
 			z.hit_t = max(z.hit_t - 1, 0)
 
@@ -384,24 +407,28 @@ local function draw_world()
 	end
 end
 
-local function draw_zombie(z)
-	local bob = sin(z.wob) * 1.5
-	local body = z.hit_t > 0 and 7 or 3
-	local skin = z.hit_t > 0 and 7 or 11
-	local x, y = z.x, z.y + bob
-	local dir = z.x < car.x and 1 or -1
+-- draw a sprite centred on (x, y) with pink as the transparent colour.
+-- tint (optional) recolours every visible pixel, for hit flashes etc.
+local function draw_sprite(s, x, y, w, h, flip_x, tint)
+	palt(0, false)
+	palt(TRANS_COL, true)
+	if tint then
+		for c=0,31 do
+			if c ~= TRANS_COL then pal(c, tint) end
+		end
+	end
 
-	-- legs
-	line(x-2, y+3, x-2 - bob, y+8, 1)
-	line(x+2, y+3, x+2 + bob, y+8, 1)
-	-- torso
-	rectfill(x-3, y-4, x+3, y+3, body)
-	-- arms reaching toward the car
-	line(x, y-3, x + dir*8, y-4 + bob, skin)
-	line(x, y-1, x + dir*8, y-1 - bob, skin)
-	-- head
-	circfill(x, y-7, 3, skin)
-	pset(x + dir, y-8, 8)
+	spr(s, x - w/2, y - h/2, flip_x)
+
+	pal()
+	palt()
+end
+
+local function draw_zombie(z)
+	-- the sprite faces left, so flip it when the car is off to the right
+	local flip = z.x < car.x
+	local frame = walk_phase(z)
+	draw_sprite(ZOMBIE_SPR + frame, z.x, z.y, zw, zh, flip, z.hit_t > 0 and 7 or nil)
 end
 
 local function draw_gunner()
@@ -433,19 +460,7 @@ local function draw_car()
 	if state == "over" then tint = 1      -- burnt-out wreck
 	elseif flash then tint = 8 end        -- hit flash
 
-	-- black is part of the car, so swap transparency over to pink
-	palt(0, false)
-	palt(CAR_TRANS, true)
-	if tint then
-		for c=0,31 do
-			if c ~= CAR_TRANS then pal(c, tint) end
-		end
-	end
-
-	spr(car_img, car.x - car.w/2, car.y - car.h/2)
-
-	pal()
-	palt()
+	draw_sprite(car_img, car.x, car.y, car.w, car.h, false, tint)
 end
 
 local function draw_hud()
