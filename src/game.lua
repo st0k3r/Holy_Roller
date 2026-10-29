@@ -13,23 +13,44 @@ local FIRE_DELAY = 8     -- frames between shots
 local BULLET_SPD = 7
 local GUN_RANGE = 260
 
+local CRUISE_SPEED = 4
+local ACCEL = 0.05
+local BRAKE = 0.06
+local DRIVE_TIME = 180   -- frames spent cruising between waves
+
+local CAR_SPR = 1
+local CAR_TRANS = 14     -- pink is the transparent colour in the car sprite (it's mostly black)
+
 local state         -- "title", "play", "over"
+-- while playing, phase cycles: "drive" -> "brake" -> "wave" -> "drive" ...
+local phase, phase_t, wave, to_spawn
+local banner, banner_t
 local car, gunner
 local zombies, bullets, parts
-local scroll, speed, score, kills, frame, spawn_t, shake
+local scroll, speed, score, kills, spawn_t, shake
 
 function reset_game()
-	car = {x=SW/2, y=185, w=30, h=54, hp=10, max_hp=10, hit_t=0}
+	-- size the car (and its hitbox) from the sprite
+	local s = get_spr(CAR_SPR)
+	car = {x=SW/2, y=185, w=s:width(), h=s:height(), hp=10, max_hp=10, hit_t=0}
 	-- side: -1 left, 1 right, 0 inside. out: lean amount 0..1
 	gunner = {side=0, out=0, cool=0, ax=0, ay=-1, flash=0}
 	zombies, bullets, parts = {}, {}, {}
-	scroll, speed = 0, 3
-	score, kills, frame = 0, 0, 0
-	spawn_t, shake = 60, 0
+	score, kills = 0, 0
+	spawn_t, shake = 0, 0
+	wave, to_spawn = 1, 0
+	phase, phase_t = "drive", DRIVE_TIME
+	banner, banner_t = "", 0
+end
+
+local function show_banner(text)
+	banner, banner_t = text, 90
 end
 
 function _init()
 	state = "title"
+	-- road state lives outside reset_game so starting a run doesn't jolt the car
+	scroll, speed = 0, CRUISE_SPEED
 	reset_game()
 end
 
@@ -67,12 +88,11 @@ end
 
 local function spawn_zombie()
 	local side = rnd(1) < 0.5 and -1 or 1
-	local difficulty = min(frame / 3600, 1)  -- ramps over ~1 minute
 	add(zombies, {
 		x = side < 0 and -8 or SW+8,
 		y = 10 + rnd(SH-20),
 		side = side,
-		spd = 0.35 + rnd(0.3) + difficulty*0.5,
+		spd = 0.35 + rnd(0.3) + min(wave * 0.08, 0.6),
 		hp = 2,
 		hit_t = 0,
 		wob = rnd(1),
@@ -134,20 +154,44 @@ local function hurt_car(x, y)
 	end
 end
 
+local function update_phase()
+	if phase == "drive" then
+		speed = min(speed + ACCEL, CRUISE_SPEED)
+		phase_t -= 1
+		if phase_t <= 0 then phase = "brake" end
+
+	elseif phase == "brake" then
+		speed = max(speed - BRAKE, 0)
+		if speed == 0 then
+			phase = "wave"
+			to_spawn = 6 + wave * 4
+			spawn_t = 30
+			show_banner("WAVE " .. wave)
+		end
+
+	elseif phase == "wave" then
+		spawn_t -= 1
+		if to_spawn > 0 and spawn_t <= 0 then
+			spawn_zombie()
+			to_spawn -= 1
+			spawn_t = max(10, 45 - wave * 4)
+		end
+		if to_spawn == 0 and #zombies == 0 then
+			score += 50 * wave
+			show_banner("WAVE " .. wave .. " CLEAR")
+			wave += 1
+			phase, phase_t = "drive", DRIVE_TIME
+		end
+	end
+end
+
 local function update_play()
-	frame += 1
-	speed = 3 + min(frame / 3600, 1) * 2
+	update_phase()
 	scroll += speed
 	score += speed * 0.02
+	banner_t = max(banner_t - 1, 0)
 
 	update_gunner()
-
-	-- spawning gets faster over time
-	spawn_t -= 1
-	if spawn_t <= 0 then
-		spawn_zombie()
-		spawn_t = max(18, 70 - frame / 60)
-	end
 
 	-- bullets
 	for i=#bullets,1,-1 do
@@ -218,7 +262,7 @@ function _update()
 	update_parts()
 
 	if state == "title" then
-		scroll += 2
+		scroll += speed
 		if btnp(4) or btnp(5) then
 			reset_game()
 			state = "play"
@@ -305,44 +349,33 @@ local function draw_gunner()
 end
 
 local function draw_car()
-	if state == "over" then
-		-- burnt-out wreck
-		rectfill(car.x - car.w/2, car.y - car.h/2, car.x + car.w/2, car.y + car.h/2, 1)
-		return
+	local flash = car.hit_t > 0 and flr(car.hit_t / 3) % 2 == 0
+	local tint = nil
+	if state == "over" then tint = 1      -- burnt-out wreck
+	elseif flash then tint = 8 end        -- hit flash
+
+	-- black is part of the car, so swap transparency over to pink
+	palt(0, false)
+	palt(CAR_TRANS, true)
+	if tint then
+		for c=0,31 do
+			if c ~= CAR_TRANS then pal(c, tint) end
+		end
 	end
 
-	local x0, y0 = car.x - car.w/2, car.y - car.h/2
-	local x1, y1 = car.x + car.w/2, car.y + car.h/2
-	local flash = car.hit_t > 0 and flr(car.hit_t / 3) % 2 == 0
-	local body = flash and 8 or 7
+	spr(CAR_SPR, car.x - car.w/2, car.y - car.h/2)
 
-	-- wheels
-	rectfill(x0-2, y0+6, x0, y0+16, 0)
-	rectfill(x1, y0+6, x1+2, y0+16, 0)
-	rectfill(x0-2, y1-16, x0, y1-6, 0)
-	rectfill(x1, y1-16, x1+2, y1-6, 0)
-
-	-- body
-	rectfill(x0, y0+2, x1, y1-2, body)
-	rectfill(x0+2, y0, x1-2, y1, body)
-	-- windscreen + rear window
-	rectfill(x0+4, y0+8, x1-4, y0+14, 1)
-	rectfill(x0+4, y1-10, x1-4, y1-6, 1)
-	-- side windows (where the gunner leans out)
-	rectfill(x0, y0+16, x0+1, y0+26, 1)
-	rectfill(x1-1, y0+16, x1, y0+26, 1)
-	-- roof with gold cross
-	rectfill(x0+4, y0+15, x1-4, y1-11, 6)
-	rectfill(car.x-1, y0+18, car.x+1, y1-14, 10)
-	rectfill(car.x-5, y0+22, car.x+5, y0+24, 10)
-	-- headlights
-	rectfill(x0+3, y0, x0+7, y0+1, 10)
-	rectfill(x1-7, y0, x1-3, y0+1, 10)
+	pal()
+	palt()
 end
 
 local function draw_hud()
 	print("SCORE " .. flr(score), 6, 6, 7)
 	print("KILLS " .. kills, 6, 16, 7)
+	print("WAVE " .. wave, 6, 26, 7)
+	if phase == "wave" then
+		print("LEFT " .. (to_spawn + #zombies), 6, 36, 8)
+	end
 
 	-- health bar
 	local bw = 80
@@ -374,6 +407,11 @@ function _draw()
 		print_c("press Z or X to start", 132, 6)
 	elseif state == "play" then
 		draw_hud()
+		-- blink the banner in its final half-second
+		if banner_t > 30 or (banner_t > 0 and banner_t % 8 < 4) then
+			rectfill(SW/2 - 60, 54, SW/2 + 60, 70, 0)
+			print_c(banner, 59, 10)
+		end
 	elseif state == "over" then
 		draw_hud()
 		rectfill(SW/2 - 90, 100, SW/2 + 90, 150, 0)
