@@ -33,23 +33,29 @@ local DRIVE_TIME = 180   -- frames spent cruising between waves
 local CAR_SPR = 1
 local CAR_TRANS = 14     -- pink is the transparent colour in the car sprite (it's mostly black)
 
+local STEER_SPEED = 2.5  -- sideways speed when steering between waves
+local ROADKILL_SCORE = 25
+local ROADKILL_HEAL = 1
+
 local state         -- "title", "play", "over"
 -- while playing, phase cycles: "drive" -> "brake" -> "wave" -> "drive" ...
 local phase, phase_t, wave, to_spawn
 local banner, banner_t
-local car, gunner
-local zombies, bullets, parts
-local scroll, speed, score, kills, spawn_t, shake
+local car, car_img, gunner
+local zombies, road_zs, bullets, parts
+local scroll, speed, score, kills, spawn_t, road_t, shake
 
 function reset_game()
 	-- size the car (and its hitbox) from the sprite
 	local s = get_spr(CAR_SPR)
 	car = {x=SW/2, y=185, w=s:width(), h=s:height(), hp=10, max_hp=10, hit_t=0}
+	-- private copy of the sprite so blood can be painted onto it
+	car_img = s:copy()
 	-- side: -1 left, 1 right, 0 inside. out: lean amount 0..1
 	gunner = {side=0, out=0, cool=0, ax=0, ay=-1, flash=0}
-	zombies, bullets, parts = {}, {}, {}
+	zombies, road_zs, bullets, parts = {}, {}, {}, {}
 	score, kills = 0, 0
-	spawn_t, shake = 0, 0
+	spawn_t, road_t, shake = 0, 30, 0
 	wave, to_spawn = 1, 0
 	phase, phase_t = "drive", DRIVE_TIME
 	banner, banner_t = "", 0
@@ -111,12 +117,25 @@ local function spawn_zombie()
 	})
 end
 
+-- stragglers standing in the road while driving; run them down for points + HP
+local function spawn_road_zombie()
+	add(road_zs, {
+		x = ROAD_X0 + 8 + rnd(ROAD_W - 16),
+		y = -12,
+		hit_t = 0,
+		wob = rnd(1),
+	})
+end
+
 -- update -------------------------------------------------------------------
 
 local function update_gunner()
+	-- left / right only lean out during a wave; between waves they steer
 	local want = 0
-	if btn(0) then want = -1 end
-	if btn(1) then want = 1 end
+	if phase == "wave" then
+		if btn(0) then want = -1 end
+		if btn(1) then want = 1 end
+	end
 
 	-- switching sides means ducking back in first
 	if want ~= 0 and want == gunner.side then
@@ -166,6 +185,64 @@ local function hurt_car(x, y)
 	end
 end
 
+-- paint blood onto the car image around (hx, hy), in sprite pixel coords.
+-- only touches pixels that are part of the car, so it never spills onto the road.
+local function splatter(hx, hy)
+	for i=1,6 do
+		local cx = hx + rnd(12) - 6
+		local cy = hy + rnd(8) - 2
+		local r = 1 + rnd(2.5)
+		local col = rnd(1) < 0.6 and 8 or 2
+		for py=flr(cy-r),flr(cy+r) do
+			for px=flr(cx-r),flr(cx+r) do
+				if px >= 0 and py >= 0 and px < car.w and py < car.h
+				and (px-cx)^2 + (py-cy)^2 <= r*r
+				and car_img:get(px, py) ~= CAR_TRANS then
+					car_img:set(px, py, col)
+				end
+			end
+		end
+	end
+end
+
+local function steer_car()
+	if phase == "wave" then return end
+	if btn(0) then car.x -= STEER_SPEED end
+	if btn(1) then car.x += STEER_SPEED end
+	car.x = mid(ROAD_X0 + car.w/2, car.x, ROAD_X1 - car.w/2)
+end
+
+local function update_road_zombies()
+	-- only spawn while cruising, so none are left over when the wave starts
+	if phase == "drive" then
+		road_t -= 1
+		if road_t <= 0 then
+			spawn_road_zombie()
+			road_t = 25 + rnd(35)
+		end
+	end
+
+	for i=#road_zs,1,-1 do
+		local z = road_zs[i]
+		-- the road carries them toward the car; they shuffle toward it a little too
+		z.y += speed + 0.3
+		z.x += sgn(car.x - z.x) * 0.2
+		z.wob += 0.05
+
+		if abs(z.x - car.x) < car.w/2 + 3 and abs(z.y - car.y) < car.h/2 + 3 then
+			kills += 1
+			score += ROADKILL_SCORE
+			car.hp = min(car.hp + ROADKILL_HEAL, car.max_hp)
+			shake = 3
+			burst(z.x, z.y, 20, {8, 2, 3, 11}, 3)
+			splatter(z.x - (car.x - car.w/2), z.y - (car.y - car.h/2))
+			deli(road_zs, i)
+		elseif z.y > SH + 12 then
+			deli(road_zs, i)
+		end
+	end
+end
+
 local function update_phase()
 	if phase == "drive" then
 		speed = min(speed + ACCEL, CRUISE_SPEED)
@@ -203,6 +280,8 @@ local function update_play()
 	score += speed * 0.02
 	banner_t = max(banner_t - 1, 0)
 
+	steer_car()
+	update_road_zombies()
 	update_gunner()
 
 	-- bullets
@@ -375,7 +454,7 @@ local function draw_car()
 		end
 	end
 
-	spr(CAR_SPR, car.x - car.w/2, car.y - car.h/2)
+	spr(car_img, car.x - car.w/2, car.y - car.h/2)
 
 	pal()
 	palt()
@@ -403,6 +482,7 @@ function _draw()
 
 	draw_world()
 	for p in all(parts) do pset(p.x, p.y, p.col) end
+	for z in all(road_zs) do draw_zombie(z) end
 	for z in all(zombies) do draw_zombie(z) end
 	draw_car()
 	draw_gunner()
@@ -413,10 +493,11 @@ function _draw()
 	camera()
 
 	if state == "title" then
-		rectfill(SW/2 - 110, 80, SW/2 + 110, 150, 0)
+		rectfill(SW/2 - 130, 80, SW/2 + 130, 150, 0)
 		print_c("HOLY ROLLER", 92, 10)
-		print_c("hold LEFT / RIGHT to lean out and shoot", 112, 7)
-		print_c("press Z or X to start", 132, 6)
+		print_c("waves: hold LEFT / RIGHT to lean out and shoot", 106, 7)
+		print_c("between waves: steer and run zombies down", 118, 7)
+		print_c("press Z or X to start", 134, 6)
 	elseif state == "play" then
 		draw_hud()
 		-- blink the banner in its final half-second
@@ -464,5 +545,5 @@ AAGgASACoA4ADxAADfDKAQIDQA8PkAQFBgdADJAICQoLQAyQDwwPDQ8ODEAM8P8BAOv-J6oBEAYP
 MBABIAEgAfAAAhACDhABIA8hIAEwD0Dwww8oD--wxg-4Cg--D4AP9w8NAfAJARAGDjAA------_9
 H-8BAKzPyA9AAA8QQP--sPD-AQD-6lD-----KQ==
 :: src/.info.pod
---[[pod,created="2026-10-29 15:17:32",modified="2026-10-29 15:17:35"]]
+--[[pod,created="2026-10-29 15:23:44",modified="2026-10-29 15:23:44"]]
 :: [eoc]
