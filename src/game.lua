@@ -28,12 +28,18 @@ local TRANS_COL = 14     -- pink is the transparent colour in the sprites (they 
 local STEER_SPEED = 2.5  -- sideways speed when steering between waves
 local ROADKILL_SCORE = 25
 local ROADKILL_HEAL = 1
+local GLASS_COL = 7      -- windshield colour in the car sprite
+local WIPE_SWEEP = 24    -- frames for one there-and-back pass of the wiper
+local WIPE_PASSES = 2
 
 local state         -- "title", "play", "over"
 -- while playing, phase cycles: "drive" -> "brake" -> "wave" -> "drive" ...
 local phase, phase_t, wave, to_spawn
 local banner, banner_t
 local car, car_img, gunner
+local stains            -- blood on the windshield, keyed by pixel: {x, y}
+local glass, gx0, gy0, gx1, gy1  -- windshield pixel mask and its bounds, in sprite coords
+local wiper             -- pivot (x, y), blade length, angle a; t is nil unless wiping
 local zw, zh            -- zombie sprite size
 local zombies, road_zs, bullets, parts
 local scroll, speed, score, kills, spawn_t, road_t, shake
@@ -44,6 +50,23 @@ function reset_game()
 	car = {x=SW/2, y=185, w=s:width(), h=s:height(), hp=10, max_hp=10, hit_t=0}
 	-- private copy of the sprite so blood can be painted onto it
 	car_img = s:copy()
+	stains = {}
+
+	-- find the windshield: glass pixels in the front half (the rear window is glass too)
+	glass, gx0, gy0, gx1, gy1 = {}, car.w, car.h, -1, -1
+	for py=0,flr(car.h/2)-1 do
+		for px=0,car.w-1 do
+			if s:get(px, py) == GLASS_COL then
+				glass[py*car.w + px] = true
+				gx0, gx1 = min(gx0, px), max(gx1, px)
+				gy0, gy1 = min(gy0, py), max(gy1, py)
+			end
+		end
+	end
+	-- wiper pivots at the hood edge of the windshield (the top, since the car faces up),
+	-- long enough to reach the far corners by the roof
+	local wx, wy = (gx0 + gx1 + 1)/2, gy0 - 0.5
+	wiper = {x=wx, y=wy, len=sqrt(max(wx - gx0, gx1 + 1 - wx)^2 + (gy1 + 1 - wy)^2), a=1}
 	-- side: -1 left, 1 right, 0 inside. out: lean amount 0..1
 	gunner = {side=0, out=0, cool=0, ax=0, ay=-1, flash=0}
 	zombies, road_zs, bullets, parts = {}, {}, {}, {}
@@ -194,24 +217,50 @@ local function hurt_car(x, y)
 	end
 end
 
--- paint blood onto the car image around (hx, hy), in sprite pixel coords.
--- only touches pixels that are part of the car, so it never spills onto the road.
-local function splatter(hx, hy)
-	for i=1,6 do
-		local cx = hx + rnd(12) - 6
-		local cy = hy + rnd(8) - 2
-		local r = 1 + rnd(2.5)
+local function is_glass(px, py)
+	return px >= 0 and px < car.w and glass[py*car.w + px]
+end
+
+-- paint blood onto the windshield, roughly in line with where the zombie hit (hx, in sprite coords).
+-- only glass pixels get painted; it stays there until the wiper clears it.
+local function splatter(hx)
+	for i=1,3 do
+		local cx = mid(gx0, hx + rnd(8) - 4, gx1)
+		local cy = gy0 + rnd(gy1 - gy0 + 1)
+		local r = 0.7 + rnd(1.5)
 		local col = rnd(1) < 0.6 and 8 or 2
 		for py=flr(cy-r),flr(cy+r) do
 			for px=flr(cx-r),flr(cx+r) do
-				if px >= 0 and py >= 0 and px < car.w and py < car.h
-				and (px-cx)^2 + (py-cy)^2 <= r*r
-				and car_img:get(px, py) ~= TRANS_COL then
+				if is_glass(px, py) and (px-cx)^2 + (py-cy)^2 <= r*r then
 					car_img:set(px, py, col)
+					stains[py*car.w + px] = {x=px, y=py}
 				end
 			end
 		end
 	end
+end
+
+local function start_wipe()
+	wiper.t, wiper.a = 0, 1
+end
+
+-- swing the wiper across the windshield and back; blood the blade passes over becomes clean glass.
+-- angle 1 lies flat pointing right, 0.75 straight down toward the roof, 0.5 flat pointing left.
+local function update_wiper()
+	if not wiper.t then return end
+	wiper.t += 1
+	local prev = wiper.a
+	wiper.a = 0.75 + 0.25 * cos(wiper.t / WIPE_SWEEP)
+	local lo, hi = min(prev, wiper.a), max(prev, wiper.a)
+	for key, st in pairs(stains) do
+		-- wrap into 0..1, since stains below the pivot can come back from atan2 as negative angles
+		local a = atan2(st.x + 0.5 - wiper.x, st.y + 0.5 - wiper.y) % 1
+		if a >= lo and a <= hi then
+			car_img:set(st.x, st.y, GLASS_COL)
+			stains[key] = nil
+		end
+	end
+	if wiper.t >= WIPE_SWEEP * WIPE_PASSES then wiper.t = nil end
 end
 
 local function steer_car()
@@ -245,7 +294,7 @@ local function update_road_zombies()
 			car.hp = min(car.hp + ROADKILL_HEAL, car.max_hp)
 			shake = 3
 			burst(z.x, z.y, 20, {8, 2, 3, 11}, 3)
-			splatter(z.x - (car.x - car.w/2), z.y - (car.y - car.h/2))
+			splatter(z.x - (car.x - car.w/2))
 			deli(road_zs, i)
 		elseif z.y > SH + zh then
 			deli(road_zs, i)
@@ -266,6 +315,7 @@ local function update_phase()
 			to_spawn = 6 + wave * 4
 			spawn_t = 30
 			show_banner("WAVE " .. wave)
+			start_wipe()
 		end
 
 	elseif phase == "wave" then
@@ -345,6 +395,7 @@ local function update_play()
 	end
 
 	car.hit_t = max(car.hit_t - 1, 0)
+	update_wiper()
 end
 
 local function update_parts()
@@ -461,6 +512,16 @@ local function draw_car()
 	elseif flash then tint = 8 end        -- hit flash
 
 	draw_sprite(car_img, car.x, car.y, car.w, car.h, false, tint)
+
+	-- wiper blade, only drawn where it's over the glass
+	if wiper.t then
+		local ox, oy = flr(car.x - car.w/2), flr(car.y - car.h/2)
+		local dx, dy = cos(wiper.a), sin(wiper.a)
+		for d=1,wiper.len,0.5 do
+			local px, py = flr(wiper.x + dx*d), flr(wiper.y + dy*d)
+			if is_glass(px, py) then pset(ox + px, oy + py, 0) end
+		end
+	end
 end
 
 local function draw_hud()
