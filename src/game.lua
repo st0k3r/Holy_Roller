@@ -2,6 +2,7 @@
 -- Holy Roller
 -- the car drives up the middle of the road while zombies close in from both sides.
 -- hold left / right to lean out of that window; while leaning out you auto-fire.
+-- driving burns fuel; run dry and the priest has to find a gas can in a first person forest maze.
 
 local SW, SH = 480, 270
 local ROAD_W = 140
@@ -32,8 +33,15 @@ local GLASS_COL = 7      -- windshield colour in the car sprite
 local WIPE_SWEEP = 24    -- frames for one there-and-back pass of the wiper
 local WIPE_PASSES = 2
 
-local state         -- "title", "play", "over"
+local MAX_FUEL = 100
+local FUEL_BURN = 0.03   -- fuel per frame per unit of speed, so a parked car burns nothing
+local ROADKILL_FUEL = 4  -- running a zombie down costs a little fuel
+local LOW_FUEL = 25
+local STALL_WAIT = 60    -- frames sat dead on the road before the priest gets out
+
+local state         -- "title", "play", "maze", "over"
 -- while playing, phase cycles: "drive" -> "brake" -> "wave" -> "drive" ...
+-- running out of fuel cuts in with "stall", which hands over to the maze
 local phase, phase_t, wave, to_spawn
 local banner, banner_t
 local car, car_img, gunner
@@ -43,6 +51,8 @@ local wiper             -- pivot (x, y), blade length, angle a; t is nil unless 
 local zw, zh            -- zombie sprite size
 local zombies, road_zs, bullets, parts
 local scroll, speed, score, kills, spawn_t, road_t, shake
+local fuel, strandings  -- strandings counts trips into the maze; each one is harder
+local mz                -- maze state while on foot, nil while driving
 
 function reset_game()
 	-- size the car (and its hitbox) from the sprite
@@ -75,6 +85,8 @@ function reset_game()
 	wave, to_spawn = 1, 0
 	phase, phase_t = "drive", DRIVE_TIME
 	banner, banner_t = "", 0
+	fuel, strandings = MAX_FUEL, 0
+	mz = nil
 end
 
 local function show_banner(text)
@@ -157,6 +169,470 @@ end
 local function shamble(z)
 	local frame, t = walk_phase(z)
 	return STEP_PUSH[frame + 1] * (1 - cos(t))
+end
+
+-- the forest maze ----------------------------------------------------------
+-- out of gas: the priest searches a maze of trees for a gas can, seen first person.
+-- the map is a grid of tiles (1 = trees, 0 = path); positions are in tiles, y pointing down.
+
+local TEX = 32           -- tree wall texture size
+local COLW = 2           -- screen pixels per ray
+local NCOL = SW / COLW
+local FOV_K = 0.66       -- camera plane length; about a 66 degree field of view
+local FOG_STEP = 2.2     -- tiles per step of darkness
+local WALK_SPD = 0.05
+local TURN_SPD = 0.012   -- turns (fractions of a full circle) per frame
+local BODY_R = 0.2       -- collision radius for the priest and zombies
+local MZ_FIRE_DELAY = 12
+local MZ_ZOMBIE_SPD = 0.022
+local MZ_AGGRO = 7       -- zombies notice you within this many tiles
+local MZ_ZOMBIE_SCALE = 0.75  -- zombie height relative to the trees
+local CAN_SCALE = 0.3
+local DIRS = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}}
+
+-- each colour's darker neighbour, for fog
+local DARK = {[0]=0, 0, 1, 1, 2, 1, 5, 6, 2, 4, 9, 3, 1, 1, 2, 4}
+
+local CAN_ART = {
+	"...kkk.kkk..",
+	"...kyk.kwk..",
+	"..kkkkkkkkk.",
+	".krrrrrrrrrk",
+	".krwrrrrrrdk",
+	".krrdrrrrddk",
+	".krrrdrrdrdk",
+	".krrrrddrrdk",
+	".krrrrddrrdk",
+	".krrrdrrdrdk",
+	".krrdrrrrddk",
+	".krrrrrrrrdk",
+	".kdddddddddk",
+	"..kkkkkkkkk.",
+}
+local CAN_COLS = {["."]=TRANS_COL, k=0, r=8, d=2, y=10, w=7}
+
+local wall_tex          -- tree texture at each fog level, 0 (near) .. 4 (darkest)
+local can_img
+local zbuf = {}         -- wall distance per ray column, so sprites hide behind trees
+
+local function darken(c, n)
+	for i=1,n do c = DARK[c] or c end
+	return c
+end
+
+local function disc(img, cx, cy, r, col)
+	for y=flr(cy-r),flr(cy+r) do
+		for x=flr(cx-r),flr(cx+r) do
+			-- wrap sideways so the texture tiles along a wall
+			if y >= 0 and y < TEX and (x-cx)^2 + (y-cy)^2 <= r*r then img:set(x % TEX, y, col) end
+		end
+	end
+end
+
+local function build_maze_art()
+	-- trunks behind a mass of leaf clumps, with undergrowth along the bottom
+	local t = userdata("u8", TEX, TEX)
+	for y=0,TEX-1 do
+		for x=0,TEX-1 do t:set(x, y, 1) end
+	end
+	for tx in all({5, 21}) do
+		for y=0,TEX-1 do
+			t:set(tx, y, 4)
+			t:set(tx+1, y, 4)
+			t:set(tx+2, y, 2)
+		end
+	end
+	for i=1,50 do
+		local cx, cy, r = rnd(TEX), rnd(24), 2 + rnd(2.5)
+		disc(t, cx+1, cy+1, r, 1)
+		disc(t, cx, cy, r, 3)
+		disc(t, cx - r*0.35, cy - r*0.35, r*0.45, 11)
+	end
+	for i=1,10 do
+		local cx, cy, r = rnd(TEX), 28 + rnd(4), 1.5 + rnd(2)
+		disc(t, cx, cy, r, 3)
+		disc(t, cx - 0.5, cy - 0.8, r*0.4, 11)
+	end
+
+	wall_tex = {}
+	for lvl=0,4 do
+		local s = t:copy()
+		for y=0,TEX-1 do
+			for x=0,TEX-1 do s:set(x, y, darken(t:get(x, y), lvl)) end
+		end
+		wall_tex[lvl] = s
+	end
+
+	can_img = userdata("u8", #CAN_ART[1], #CAN_ART)
+	for y=1,#CAN_ART do
+		for x=1,#CAN_ART[y] do
+			can_img:set(x-1, y-1, CAN_COLS[CAN_ART[y]:sub(x, x)])
+		end
+	end
+end
+
+-- n x n cells carved by a recursive backtracker, then a few extra walls knocked
+-- out so there are loops to run around. cell (cx, cy) is tile (cx*2+1, cy*2+1).
+local function gen_maze(n)
+	local size = n*2 + 1
+	local m = {}
+	for y=0,size-1 do
+		m[y] = {}
+		for x=0,size-1 do m[y][x] = 1 end
+	end
+
+	m[1][1] = 0
+	local stack = {{0, 0}}
+	while #stack > 0 do
+		local c = stack[#stack]
+		local opts = {}
+		for d in all(DIRS) do
+			local nx, ny = c[1] + d[1], c[2] + d[2]
+			if nx >= 0 and nx < n and ny >= 0 and ny < n and m[ny*2+1][nx*2+1] == 1 then
+				add(opts, {nx, ny, d})
+			end
+		end
+		if #opts == 0 then
+			deli(stack)
+		else
+			local o = opts[flr(rnd(#opts)) + 1]
+			m[c[2]*2+1 + o[3][2]][c[1]*2+1 + o[3][1]] = 0
+			m[o[2]*2+1][o[1]*2+1] = 0
+			add(stack, {o[1], o[2]})
+		end
+	end
+
+	for i=1,flr(n*n/6) do
+		local x, y = 1 + flr(rnd(size-2)), 1 + flr(rnd(size-2))
+		if (x + y) % 2 == 1 then m[y][x] = 0 end  -- odd sum = a wall between two cells
+	end
+	return m, size
+end
+
+-- walking distance to every open tile from (sx, sy); also returns the farthest tile
+local function maze_dists(m, size, sx, sy)
+	local dist = {[sy*size + sx] = 0}
+	local q, qi = {{sx, sy}}, 1
+	while qi <= #q do
+		local c = q[qi]
+		qi += 1
+		local d = dist[c[2]*size + c[1]]
+		for dir in all(DIRS) do
+			local nx, ny = c[1] + dir[1], c[2] + dir[2]
+			if m[ny][nx] == 0 and not dist[ny*size + nx] then
+				dist[ny*size + nx] = d + 1
+				add(q, {nx, ny})
+			end
+		end
+	end
+	return dist, q[#q]
+end
+
+local function wall(x, y)
+	local row = mz.map[y]
+	return not row or row[x] ~= 0
+end
+
+local function blocked(x, y)
+	local r = BODY_R
+	return wall(flr(x-r), flr(y-r)) or wall(flr(x+r), flr(y-r))
+		or wall(flr(x-r), flr(y+r)) or wall(flr(x+r), flr(y+r))
+end
+
+-- slide along walls: each axis moves only if it stays clear
+local function move_body(o, dx, dy)
+	if not blocked(o.x + dx, o.y) then o.x += dx end
+	if not blocked(o.x, o.y + dy) then o.y += dy end
+end
+
+-- facing angle a is in turns: 0 east, 0.25 north (sin is flipped for screen space).
+-- the camera plane points to the priest's right
+local function set_dir()
+	mz.dx, mz.dy = cos(mz.a), sin(mz.a)
+	mz.plx, mz.ply = -mz.dy * FOV_K, mz.dx * FOV_K
+end
+
+-- march a ray through the grid (DDA). returns the distance to the wall along the view
+-- direction, which side was hit (0 = x face, 1 = y face) and where along the wall (0..1)
+local function cast(rdx, rdy)
+	local mx, my = flr(mz.x), flr(mz.y)
+	local ddx = rdx == 0 and 1e30 or abs(1 / rdx)
+	local ddy = rdy == 0 and 1e30 or abs(1 / rdy)
+	local stx, sty, sdx, sdy
+	if rdx < 0 then stx, sdx = -1, (mz.x - mx) * ddx else stx, sdx = 1, (mx + 1 - mz.x) * ddx end
+	if rdy < 0 then sty, sdy = -1, (mz.y - my) * ddy else sty, sdy = 1, (my + 1 - mz.y) * ddy end
+
+	local side = 0
+	for i=1,64 do
+		if sdx < sdy then
+			sdx += ddx
+			mx += stx
+			side = 0
+		else
+			sdy += ddy
+			my += sty
+			side = 1
+		end
+		if wall(mx, my) then break end
+	end
+	mz.seen[my*mz.size + mx] = true
+
+	local d = side == 0 and sdx - ddx or sdy - ddy
+	local wx = side == 0 and mz.y + d*rdy or mz.x + d*rdx
+	return d, side, wx - flr(wx)
+end
+
+-- world position -> camera space: tx across the view, ty depth
+local function to_cam(x, y)
+	local rx, ry = x - mz.x, y - mz.y
+	local inv = 1 / (mz.plx*mz.dy - mz.dx*mz.ply)
+	return inv * (mz.dy*rx - mz.dx*ry), inv * (mz.plx*ry - mz.ply*rx)
+end
+
+local function enter_maze()
+	if not wall_tex then build_maze_art() end
+	local n = min(6 + strandings, 10)
+	strandings += 1
+
+	local m, size = gen_maze(n)
+	mz = {map=m, size=size, x=1.5, y=1.5, cool=0, flash=0, hurt_t=0, bob=0, zs={}, seen={}}
+	mz.a = m[1][2] == 0 and 0 or 0.75  -- face down the open path
+	set_dir()
+
+	-- the can is as far from the car as the maze allows
+	local dist, far = maze_dists(m, size, 1, 1)
+	mz.can = {x=far[1] + 0.5, y=far[2] + 0.5}
+
+	-- zombies wait in open tiles well away from the start
+	local spots = {}
+	for y=1,size-2 do
+		for x=1,size-2 do
+			local d = dist[y*size + x]
+			if d and d > 8 and not (x == far[1] and y == far[2]) then add(spots, {x, y}) end
+		end
+	end
+	for i=1,min(2 + strandings, 8) do
+		if #spots == 0 then break end
+		local s = deli(spots, flr(rnd(#spots)) + 1)
+		add(mz.zs, {x=s[1] + 0.5, y=s[2] + 0.5, hp=2, hit_t=0, wob=rnd(1), flip=false})
+	end
+
+	state = "maze"
+	road_zs, bullets, parts = {}, {}, {}
+	shake = 0
+	show_banner("FIND A GAS CAN")
+end
+
+local function leave_maze()
+	mz = nil
+	fuel = MAX_FUEL
+	score += 100
+	state = "play"
+	phase, phase_t = "drive", DRIVE_TIME
+	show_banner("TANK FULL")
+end
+
+local function update_maze()
+	banner_t = max(banner_t - 1, 0)
+	mz.cool = max(mz.cool - 1, 0)
+	mz.flash = max(mz.flash - 1, 0)
+	mz.hurt_t = max(mz.hurt_t - 1, 0)
+
+	-- left / right turn, up / down walk
+	if btn(0) then mz.a += TURN_SPD end
+	if btn(1) then mz.a -= TURN_SPD end
+	set_dir()
+	local mv = 0
+	if btn(2) then mv = WALK_SPD end
+	if btn(3) then mv = -WALK_SPD * 0.7 end
+	if mv ~= 0 then
+		move_body(mz, mz.dx * mv, mz.dy * mv)
+		mz.bob += 0.04
+	end
+	mz.seen[flr(mz.y)*mz.size + flr(mz.x)] = true
+
+	-- hitscan: the nearest zombie under the crosshair, if it's in front of the trees
+	if btn(4) and mz.cool == 0 then
+		mz.cool, mz.flash = MZ_FIRE_DELAY, 3
+		local best, best_d = nil, cast(mz.dx, mz.dy)
+		local half = MZ_ZOMBIE_SCALE * SH * zw / zh / SW
+		for z in all(mz.zs) do
+			local tx, ty = to_cam(z.x, z.y)
+			if ty > 0.1 and ty < best_d and abs(tx) < half then best, best_d = z, ty end
+		end
+		if best then
+			best.hp -= 1
+			best.hit_t = 4
+			move_body(best, mz.dx * 0.15, mz.dy * 0.15)  -- knockback
+		end
+	end
+
+	for i=#mz.zs,1,-1 do
+		local z = mz.zs[i]
+		z.hit_t = max(z.hit_t - 1, 0)
+		if z.hp <= 0 then
+			kills += 1
+			score += 10
+			shake = 3
+			deli(mz.zs, i)
+		else
+			local dx, dy, d = norm(mz.x - z.x, mz.y - z.y)
+			if d < MZ_AGGRO then
+				local step = shamble(z) * MZ_ZOMBIE_SPD
+				move_body(z, dx * step, dy * step)
+				z.wob += 0.05
+				-- the sprite faces left, so flip it when it's heading right across the view
+				z.flip = dx*mz.plx + dy*mz.ply > 0
+			end
+			if d < 0.45 and mz.hurt_t == 0 then
+				car.hp -= 1
+				mz.hurt_t = 40
+				shake = 6
+				move_body(z, -dx * 0.6, -dy * 0.6)
+				if car.hp <= 0 then
+					state = "over"
+					shake = 12
+				end
+			end
+		end
+	end
+
+	local _, _, d = norm(mz.can.x - mz.x, mz.can.y - mz.y)
+	if d < 0.5 then leave_maze() end
+end
+
+-- draw a sprite standing on the floor at (x, y), one ray column at a time so trees
+-- in front cut it off. returns true if any of it was on screen.
+local function draw_billboard(img, x, y, scale, fog, flip, tint)
+	local tx, ty = to_cam(x, y)
+	if ty < 0.15 then return false end
+	local iw, ih = img:width(), img:height()
+	local wall_h = SH / ty
+	local h = wall_h * scale
+	local w = h * iw / ih
+	local x0 = SW/2 * (1 + tx/ty) - w/2
+	local top = SH/2 + wall_h/2 - h
+	local c0, c1 = max(0, flr(x0 / COLW)), min(NCOL - 1, flr((x0 + w) / COLW))
+	if c0 > c1 then return false end
+
+	palt(0, false)
+	palt(TRANS_COL, true)
+	local lvl = fog and min(flr(ty / FOG_STEP), 3) or 0
+	for c=0,31 do
+		if c ~= TRANS_COL then pal(c, tint or darken(c, lvl)) end
+	end
+	local drawn = false
+	for c=c0,c1 do
+		if ty < zbuf[c] then
+			local u = flr((c*COLW + COLW/2 - x0) / w * iw)
+			if u >= 0 and u < iw then
+				if flip then u = iw - 1 - u end
+				sspr(img, u, 0, 1, ih, c*COLW, top, COLW, h)
+				drawn = true
+			end
+		end
+	end
+	pal()
+	palt()
+	return drawn
+end
+
+local function draw_gun()
+	local gx = SW/2 + cos(mz.bob) * 5
+	local gy = SH - 44 + abs(sin(mz.bob)) * 4 + (mz.flash > 0 and 4 or 0)
+
+	-- black sleeve, white cuff, hand, pistol
+	rectfill(gx-11, gy+24, gx+11, SH, 0)
+	line(gx-11, gy+24, gx-11, SH, 5)
+	line(gx+11, gy+24, gx+11, SH, 5)
+	rectfill(gx-9, gy+20, gx+9, gy+23, 7)
+	circfill(gx, gy+12, 9, 15)
+	rectfill(gx-4, gy-18, gx+4, gy+6, 5)
+	rectfill(gx-2, gy-18, gx-1, gy+6, 6)
+	rectfill(gx-1, gy-20, gx+1, gy-18, 5)
+	rectfill(gx-2, gy+2, gx+2, gy+8, 15)
+
+	if mz.flash > 0 then
+		circfill(gx, gy-22, 5 + mz.flash*2, 9)
+		circfill(gx, gy-22, 3 + mz.flash, 10)
+		circfill(gx, gy-22, 2, 7)
+	end
+end
+
+local function draw_maze()
+	camera(rnd(shake) - shake/2, rnd(shake) - shake/2)
+	local hz = SH/2
+
+	-- night sky; stars slide past as you turn (one full turn is about 5.4 screens)
+	rectfill(0, 0, SW, hz, 0)
+	for i=0,39 do
+		local x = (i*137 + mz.a * SW * 5.4) % SW
+		pset(x, (i*53) % (hz - 20), i % 5 == 0 and 7 or (i % 2 == 0 and 6 or 5))
+	end
+
+	-- ground in the same fog bands as the trees: a row hz + hz/d is d tiles away
+	rectfill(0, hz, SW, SH, 0)
+	rectfill(0, hz + hz / (FOG_STEP*2), SW, SH, 1)
+	rectfill(0, hz + hz / FOG_STEP, SW, SH, 3)
+
+	-- trees
+	for c=0,NCOL-1 do
+		local camx = 2 * (c + 0.5) / NCOL - 1
+		local d, side, u = cast(mz.dx + mz.plx*camx, mz.dy + mz.ply*camx)
+		zbuf[c] = d
+		local h = SH / d
+		local lvl = min(flr(d / FOG_STEP), 3) + side  -- y faces a shade darker
+		sspr(wall_tex[lvl], flr(u * TEX), 0, 1, TEX, c*COLW, hz - h/2, COLW, h)
+	end
+
+	-- zombies and the can, far to near
+	local sprites = {}
+	for z in all(mz.zs) do add(sprites, {o=z, d=(z.x - mz.x)^2 + (z.y - mz.y)^2}) end
+	add(sprites, {o=mz.can, d=(mz.can.x - mz.x)^2 + (mz.can.y - mz.y)^2})
+	for i=2,#sprites do
+		local j = i
+		while j > 1 and sprites[j-1].d < sprites[j].d do
+			sprites[j-1], sprites[j] = sprites[j], sprites[j-1]
+			j -= 1
+		end
+	end
+	for s in all(sprites) do
+		local o = s.o
+		if o == mz.can then
+			-- no fog on the can so it stands out once you've found the right corridor
+			if draw_billboard(can_img, o.x, o.y, CAN_SCALE, false, false) then o.seen = true end
+		else
+			local frame = walk_phase(o)
+			draw_billboard(get_spr(ZOMBIE_SPR + frame), o.x, o.y, MZ_ZOMBIE_SCALE, true, o.flip,
+				o.hit_t > 0 and 7 or nil)
+		end
+	end
+
+	draw_gun()
+	if mz.hurt_t > 25 then
+		for i=0,3 do rect(i, i, SW-1-i, SH-1-i, 8) end
+	end
+	camera()
+end
+
+-- everything you've laid eyes on, while X is held
+local function draw_automap()
+	local size = mz.size
+	local cs = flr(min(200 / size, 12))
+	local ox, oy = flr(SW/2 - size*cs/2), flr(SH/2 - size*cs/2)
+	rectfill(ox-4, oy-4, ox + size*cs + 3, oy + size*cs + 3, 0)
+	rect(ox-4, oy-4, ox + size*cs + 3, oy + size*cs + 3, 5)
+	for y=0,size-1 do
+		for x=0,size-1 do
+			if mz.seen[y*size + x] then
+				rectfill(ox + x*cs, oy + y*cs, ox + x*cs + cs-1, oy + y*cs + cs-1, mz.map[y][x] == 1 and 3 or 1)
+			end
+		end
+	end
+	if mz.can.seen then circfill(ox + mz.can.x*cs, oy + mz.can.y*cs, 2, 8) end
+	local px, py = ox + mz.x*cs, oy + mz.y*cs
+	line(px, py, px + mz.dx*cs, py + mz.dy*cs, 10)
+	circfill(px, py, 1.5, 10)
 end
 
 -- update -------------------------------------------------------------------
@@ -263,6 +739,15 @@ local function update_wiper()
 	if wiper.t >= WIPE_SWEEP * WIPE_PASSES then wiper.t = nil end
 end
 
+local function burn_fuel(amount)
+	if phase == "stall" then return end
+	fuel = max(fuel - amount, 0)
+	if fuel == 0 then
+		phase, phase_t = "stall", STALL_WAIT
+		show_banner("OUT OF GAS")
+	end
+end
+
 local function steer_car()
 	if phase == "wave" then return end
 	if btn(0) then car.x -= STEER_SPEED end
@@ -292,6 +777,7 @@ local function update_road_zombies()
 			kills += 1
 			score += ROADKILL_SCORE
 			car.hp = min(car.hp + ROADKILL_HEAL, car.max_hp)
+			burn_fuel(ROADKILL_FUEL)
 			shake = 3
 			burst(z.x, z.y, 20, {8, 2, 3, 11}, 3)
 			splatter(z.x - (car.x - car.w/2))
@@ -331,11 +817,21 @@ local function update_phase()
 			wave += 1
 			phase, phase_t = "drive", DRIVE_TIME
 		end
+
+	elseif phase == "stall" then
+		-- coast to a stop, sit a moment, then the priest gets out and walks
+		speed = max(speed - BRAKE, 0)
+		if speed == 0 then
+			phase_t -= 1
+			if phase_t <= 0 then enter_maze() end
+		end
 	end
 end
 
 local function update_play()
 	update_phase()
+	if state ~= "play" then return end
+	burn_fuel(speed * FUEL_BURN)
 	scroll += speed
 	score += speed * 0.02
 	banner_t = max(banner_t - 1, 0)
@@ -422,6 +918,8 @@ function _update()
 		end
 	elseif state == "play" then
 		update_play()
+	elseif state == "maze" then
+		update_maze()
 	elseif state == "over" then
 		if btnp(4) or btnp(5) then
 			reset_game()
@@ -524,6 +1022,14 @@ local function draw_car()
 	end
 end
 
+local function draw_bar(label, y, frac, col)
+	local bw = 80
+	local bx = SW - bw - 6
+	print(label, bx - 22, y, 7)
+	rectfill(bx, y, bx + bw, y + 6, 0)
+	if frac > 0 then rectfill(bx, y, bx + bw * frac, y + 6, col) end
+end
+
 local function draw_hud()
 	print("SCORE " .. flr(score), 6, 6, 7)
 	print("KILLS " .. kills, 6, 16, 7)
@@ -532,47 +1038,63 @@ local function draw_hud()
 		print("LEFT " .. (to_spawn + #zombies), 6, 36, 8)
 	end
 
-	-- health bar
-	local bw = 80
-	local bx = SW - bw - 6
-	print("HP", bx - 14, 6, 7)
-	rectfill(bx, 6, bx + bw, 12, 0)
-	rectfill(bx, 6, bx + bw * car.hp / car.max_hp, 12, car.hp > 3 and 11 or 8)
+	if mz then
+		print("ON FOOT - FIND A GAS CAN", 6, 36, 9)
+		print("hold X for map", 6, SH - 12, 5)
+	end
+
+	draw_bar("HP", 6, car.hp / car.max_hp, car.hp > 3 and 11 or 8)
+	-- low fuel blinks red
+	local low = fuel < LOW_FUEL
+	draw_bar("FUEL", 16, fuel / MAX_FUEL, low and (flr(time() * 4) % 2 == 0 and 8 or 2) or 9)
+	if low and not mz then print(fuel > 0 and "LOW FUEL" or "EMPTY", SW - 86, 26, 8) end
+end
+
+local function draw_banner()
+	-- blink the banner in its final half-second
+	if banner_t > 30 or (banner_t > 0 and banner_t % 8 < 4) then
+		rectfill(SW/2 - 60, 54, SW/2 + 60, 70, 0)
+		print_c(banner, 59, 10)
+	end
 end
 
 function _draw()
 	cls(0)
-	camera(rnd(shake) - shake/2, rnd(shake) - shake/2)
 
-	draw_world()
-	for p in all(parts) do pset(p.x, p.y, p.col) end
-	for z in all(road_zs) do draw_zombie(z) end
-	for z in all(zombies) do draw_zombie(z) end
-	draw_car()
-	draw_gunner()
-	for b in all(bullets) do
-		line(b.x, b.y, b.x - b.vx*0.6, b.y - b.vy*0.6, 10)
+	if mz then
+		draw_maze()
+	else
+		camera(rnd(shake) - shake/2, rnd(shake) - shake/2)
+
+		draw_world()
+		for p in all(parts) do pset(p.x, p.y, p.col) end
+		for z in all(road_zs) do draw_zombie(z) end
+		for z in all(zombies) do draw_zombie(z) end
+		draw_car()
+		draw_gunner()
+		for b in all(bullets) do
+			line(b.x, b.y, b.x - b.vx*0.6, b.y - b.vy*0.6, 10)
+		end
+
+		camera()
 	end
 
-	camera()
-
 	if state == "title" then
-		rectfill(SW/2 - 130, 80, SW/2 + 130, 150, 0)
-		print_c("HOLY ROLLER", 92, 10)
-		print_c("waves: hold LEFT / RIGHT to lean out and shoot", 106, 7)
-		print_c("between waves: steer and run zombies down", 118, 7)
-		print_c("press Z or X to start", 134, 6)
-	elseif state == "play" then
+		rectfill(SW/2 - 130, 74, SW/2 + 130, 168, 0)
+		print_c("HOLY ROLLER", 86, 10)
+		print_c("waves: hold LEFT / RIGHT to lean out and shoot", 100, 7)
+		print_c("between waves: steer and run zombies down", 112, 7)
+		print_c("driving burns fuel, and so does roadkill", 124, 7)
+		print_c("run dry and you walk: find a gas can in the woods", 136, 7)
+		print_c("press Z or X to start", 152, 6)
+	elseif state == "play" or state == "maze" then
 		draw_hud()
-		-- blink the banner in its final half-second
-		if banner_t > 30 or (banner_t > 0 and banner_t % 8 < 4) then
-			rectfill(SW/2 - 60, 54, SW/2 + 60, 70, 0)
-			print_c(banner, 59, 10)
-		end
+		draw_banner()
+		if mz and btn(5) then draw_automap() end
 	elseif state == "over" then
 		draw_hud()
 		rectfill(SW/2 - 90, 100, SW/2 + 90, 150, 0)
-		print_c("THE HORDE PREVAILS", 110, 8)
+		print_c(mz and "LOST IN THE WOODS" or "THE HORDE PREVAILS", 110, 8)
 		print_c("score " .. flr(score) .. "   kills " .. kills, 122, 7)
 		print_c("press Z or X to ride again", 136, 6)
 	end
