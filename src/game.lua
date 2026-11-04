@@ -2,7 +2,9 @@
 -- Holy Roller
 -- the car drives up the middle of the road while zombies close in from both sides.
 -- hold left / right to lean out of that window; while leaning out you auto-fire.
--- driving burns fuel; run dry and the priest has to find a gas can in a first person forest maze.
+-- the rifle reloads itself when empty, or early with Z.
+-- driving burns fuel; run dry and the priest has to find a gas can in a first person forest maze,
+-- with a pistol that fires once per press of Z and can't be reloaded.
 
 local SW, SH = 480, 270
 local ROAD_W = 140
@@ -13,6 +15,8 @@ local LEAN_SPEED = 0.15  -- how fast the gunner leans out / ducks back in (0..1 
 local FIRE_DELAY = 8     -- frames between shots
 local BULLET_SPD = 7
 local GUN_RANGE = 260
+local RIFLE_MAG = 30     -- rounds per magazine
+local RELOAD_TIME = 90   -- frames to reload the rifle
 
 local CRUISE_SPEED = 4
 local ACCEL = 0.05
@@ -103,7 +107,8 @@ function reset_game()
 	local wx, wy = (gx0 + gx1 + 1)/2, gy0 - 0.5
 	wiper = {x=wx, y=wy, len=sqrt(max(wx - gx0, gx1 + 1 - wx)^2 + (gy1 + 1 - wy)^2), a=1}
 	-- side: -1 left, 1 right, 0 inside. out: lean amount 0..1
-	gunner = {side=0, out=0, cool=0, ax=0, ay=-1, flash=0}
+	-- ammo: rounds in the magazine. reload: frames left, nil unless reloading. trig: Z held last frame
+	gunner = {side=0, out=0, cool=0, ax=0, ay=-1, flash=0, ammo=RIFLE_MAG, reload=nil, trig=false}
 	zombies, road_zs, bullets, parts = {}, {}, {}, {}
 	score, kills = 0, 0
 	spawn_t, road_t, shake = 0, 30, 0
@@ -221,6 +226,7 @@ local WALK_SPD = 0.05
 local TURN_SPD = 0.012   -- turns (fractions of a full circle) per frame
 local BODY_R = 0.2       -- collision radius for the priest and zombies
 local MZ_FIRE_DELAY = 12
+local PISTOL_SPARE = 3   -- bullets on top of what it takes to kill every zombie in the maze
 local MZ_ZOMBIE_SPD = 0.022
 local MZ_AGGRO = 7       -- zombies notice you within this many tiles
 local MZ_ZOMBIE_SCALE = 0.75  -- zombie height relative to the trees
@@ -454,6 +460,12 @@ local function enter_maze()
 		add(mz.zs, {x=s[1] + 0.5, y=s[2] + 0.5, hp=2, hit_t=0, wob=rnd(1), flip=false})
 	end
 
+	-- zombies take one bullet per hp and shots are hitscan, so this is exactly enough plus the spare.
+	-- trig starts as the current button state so a held Z doesn't fire on arrival
+	mz.max_ammo = PISTOL_SPARE
+	for z in all(mz.zs) do mz.max_ammo += z.hp end
+	mz.ammo, mz.trig = mz.max_ammo, btn(4)
+
 	state = "maze"
 	road_zs, bullets, parts = {}, {}, {}
 	shake = 0
@@ -489,7 +501,11 @@ local function update_maze()
 	mz.seen[flr(mz.y)*mz.size + flr(mz.x)] = true
 
 	-- hitscan: the nearest zombie under the crosshair, if it's in front of the trees
-	if btn(4) and mz.cool == 0 then
+	-- semi-auto: fires on the press only (btnp won't do, it repeats while held)
+	local pulled = btn(4) and not mz.trig
+	mz.trig = btn(4)
+	if pulled and mz.cool == 0 and mz.ammo > 0 then
+		mz.ammo -= 1
 		mz.cool, mz.flash = MZ_FIRE_DELAY, 3
 		local best, best_d = nil, cast(mz.dx, mz.dy)
 		local half = MZ_ZOMBIE_SCALE * SH * zw / zh / SW
@@ -698,6 +714,20 @@ local function update_gunner()
 
 	gunner.cool = max(gunner.cool - 1, 0)
 	gunner.flash = max(gunner.flash - 1, 0)
+
+	-- reloading carries on wherever the priest is, so he can top up between waves
+	local pulled = btn(4) and not gunner.trig
+	gunner.trig = btn(4)
+	if gunner.reload then
+		gunner.reload -= 1
+		if gunner.reload <= 0 then
+			gunner.reload = nil
+			gunner.ammo = RIFLE_MAG
+		end
+	elseif pulled and gunner.ammo < RIFLE_MAG then
+		gunner.reload = RELOAD_TIME
+	end
+
 	if gunner.side == 0 or gunner.out < 1 then return end
 
 	-- find nearest zombie on this side of the car
@@ -712,11 +742,13 @@ local function update_gunner()
 
 	if target then
 		gunner.ax, gunner.ay = norm(target.x - sx, target.y - sy)
-		if gunner.cool == 0 then
+		if gunner.cool == 0 and not gunner.reload then
 			local mx, my = muzzle_pos()
 			add(bullets, {x=mx, y=my, vx=gunner.ax*BULLET_SPD, vy=gunner.ay*BULLET_SPD, life=50})
 			gunner.cool = FIRE_DELAY
 			gunner.flash = 3
+			gunner.ammo -= 1
+			if gunner.ammo == 0 then gunner.reload = RELOAD_TIME end
 		end
 	else
 		-- idle aim: straight out the window
@@ -1036,17 +1068,29 @@ local function draw_gunner()
 	draw_sprite(PRIEST_SPR, sx, sy, pw, ph, s < 0)
 
 	if gunner.out >= 1 then
-		local mx, my = muzzle_pos()
+		-- the gun dips away from the target while he swaps magazines
+		local ax, ay = gunner.ax, gunner.ay
+		if gunner.reload then ax, ay = s*0.6, 0.8 end
+		local mx, my = sx + ax*8, sy + ay*8
 		line(sx, sy, mx, my, 6)
 		-- hands gripping the gun: one near the stock, one further up the barrel
 		for d in all(PRIEST_HANDS) do
-			pset(sx + gunner.ax*d, sy + gunner.ay*d, PRIEST_SKIN)
+			pset(sx + ax*d, sy + ay*d, PRIEST_SKIN)
 		end
-		if gunner.flash > 0 then
+		if gunner.flash > 0 and not gunner.reload then
 			circfill(mx, my, 2 + gunner.flash, 10)
 			circfill(mx, my, 1 + gunner.flash/2, 7)
 		end
 	end
+end
+
+-- progress bar over the priest; sits over the car when he's ducked inside
+local function draw_reload_bar()
+	if state ~= "play" or not gunner.reload then return end
+	local sx, sy = gunner_pos()
+	local x, y, w = flr(sx) - 10, flr(sy - ph/2) - 6, 20
+	rectfill(x - 1, y - 1, x + w + 1, y + 3, 0)
+	rectfill(x, y, x + w * (1 - gunner.reload / RELOAD_TIME), y + 2, 10)
 end
 
 local function draw_car()
@@ -1076,6 +1120,24 @@ local function draw_bar(label, y, frac, col)
 	if frac > 0 then rectfill(bx, y, bx + bw * frac, y + 6, col) end
 end
 
+local function draw_ammo()
+	local y = 26
+	local text, col
+	if mz then
+		draw_bar("AMMO", y, mz.ammo / mz.max_ammo, mz.ammo > 0 and 12 or 8)
+		text = mz.ammo > 0 and "PISTOL " .. mz.ammo .. "/" .. mz.max_ammo or "PISTOL EMPTY"
+		col = mz.ammo > 0 and 7 or 8
+	elseif gunner.reload then
+		-- the bar refills as the reload runs
+		draw_bar("AMMO", y, 1 - gunner.reload / RELOAD_TIME, 10)
+		text, col = "RELOADING", flr(time() * 4) % 2 == 0 and 10 or 9
+	else
+		draw_bar("AMMO", y, gunner.ammo / RIFLE_MAG, 12)
+		text, col = "RIFLE " .. gunner.ammo .. "/" .. RIFLE_MAG, 7
+	end
+	print(text, SW - 86, y + 10, col)
+end
+
 local function draw_hud()
 	print("SCORE " .. flr(score), 6, 6, 7)
 	print("KILLS " .. kills, 6, 16, 7)
@@ -1093,7 +1155,8 @@ local function draw_hud()
 	-- low fuel blinks red
 	local low = fuel < LOW_FUEL
 	draw_bar("FUEL", 16, fuel / MAX_FUEL, low and (flr(time() * 4) % 2 == 0 and 8 or 2) or 9)
-	if low and not mz then print(fuel > 0 and "LOW FUEL" or "EMPTY", SW - 86, 26, 8) end
+	draw_ammo()
+	if low and not mz then print(fuel > 0 and "LOW FUEL" or "EMPTY", SW - 86, 46, 8) end
 end
 
 local function draw_banner()
@@ -1118,6 +1181,7 @@ function _draw()
 		for z in all(zombies) do draw_zombie(z) end
 		draw_car()
 		draw_gunner()
+		draw_reload_bar()
 		for b in all(bullets) do
 			line(b.x, b.y, b.x - b.vx*0.6, b.y - b.vy*0.6, 10)
 		end
@@ -1126,13 +1190,14 @@ function _draw()
 	end
 
 	if state == "title" then
-		rectfill(SW/2 - 130, 74, SW/2 + 130, 168, 0)
+		rectfill(SW/2 - 130, 74, SW/2 + 130, 180, 0)
 		print_c("HOLY ROLLER", 86, 10)
 		print_c("waves: hold LEFT / RIGHT to lean out and shoot", 100, 7)
 		print_c("between waves: steer and run zombies down", 112, 7)
 		print_c("driving burns fuel, and so does roadkill", 124, 7)
 		print_c("run dry and you walk: find a gas can in the woods", 136, 7)
-		print_c("press Z or X to start", 152, 6)
+		print_c("Z reloads the rifle. the pistol can't be reloaded", 148, 7)
+		print_c("press Z or X to start", 164, 6)
 	elseif state == "play" or state == "maze" then
 		draw_hud()
 		draw_banner()
