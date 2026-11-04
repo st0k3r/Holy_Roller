@@ -20,10 +20,23 @@ local BRAKE = 0.06
 local DRIVE_TIME = 180   -- frames spent cruising between waves
 
 local CAR_SPR = 1
+local PRIEST_SPR = 8     -- the gunner leaning out the window, drawn facing right
+local GUN_SPR = 9        -- the priest's right arm and pistol in the maze, first person
+local GUN_MUZZLE_X = 18  -- pixel column of the pistol's centre line in GUN_SPR
+local CROSS_SPR = 10     -- the priest's left arm and crucifix
+local CROSS_MID_X = 19   -- pixel column of the crucifix's centre line in CROSS_SPR
+local HAND_SPREAD = 80   -- how far each hand sits from the middle of the screen
+local PRIEST_REACH = 4   -- how far past the car's side the sprite's centre slides when fully leaned out
+local PRIEST_SKIN = 15   -- flesh colour, matching the face in the sprite
+local PRIEST_HANDS = {2, 5}  -- distances along the gun line where his hands grip it
 local ZOMBIE_SPR = 2     -- first walk frame, drawn facing left
 local WALK_FRAMES = 3  -- walk frames are ZOMBIE_SPR .. ZOMBIE_SPR+WALK_FRAMES-1
 local WALK_FRAME_T = 20 -- frames each walk frame is held for
 local STEP_PUSH = {1.4, 0.8, 0.8}  -- per walk frame: a big lurch on the step, weaker drag after (averages 1)
+local CRAWLER_SPR = 5    -- first crawl frame, also facing left; same frame count and timing as the walk
+local CRAWLER_CHANCE = 0.2   -- odds a wave zombie is a crawler on wave 1; rises each wave
+local CRAWLER_SPD = 2    -- crawlers close in this many times faster than walkers
+local CRAWLER_ANIM = 1.6 -- and scrabble through their frames this much faster
 local TRANS_COL = 14     -- pink is the transparent colour in the sprites (they use a lot of black)
 
 local STEER_SPEED = 2.5  -- sideways speed when steering between waves
@@ -49,6 +62,7 @@ local stains            -- blood on the windshield, keyed by pixel: {x, y}
 local glass, gx0, gy0, gx1, gy1  -- windshield pixel mask and its bounds, in sprite coords
 local wiper             -- pivot (x, y), blade length, angle a; t is nil unless wiping
 local zw, zh            -- zombie sprite size
+local pw, ph            -- priest sprite size
 local zombies, road_zs, bullets, parts
 local scroll, speed, score, kills, spawn_t, road_t, shake
 local fuel, strandings  -- strandings counts trips into the maze; each one is harder
@@ -61,6 +75,17 @@ function reset_game()
 	-- private copy of the sprite so blood can be painted onto it
 	car_img = s:copy()
 	stains = {}
+
+	-- the sprite has transparent margins, so find how far the body really reaches at the window
+	-- (the priest's row, 8px above centre) and lean him out from there
+	car.side = 0
+	local wy = flr(car.h/2) - 8
+	for px=car.w-1,0,-1 do
+		if s:get(px, wy) ~= TRANS_COL then
+			car.side = px + 1 - car.w/2
+			break
+		end
+	end
 
 	-- find the windshield: glass pixels in the front half (the rear window is glass too)
 	glass, gx0, gy0, gx1, gy1 = {}, car.w, car.h, -1, -1
@@ -99,6 +124,8 @@ function _init()
 	scroll, speed = 0, CRUISE_SPEED
 	local zs = get_spr(ZOMBIE_SPR)
 	zw, zh = zs:width(), zs:height()
+	local ps = get_spr(PRIEST_SPR)
+	pw, ph = ps:width(), ps:height()
 	reset_game()
 end
 
@@ -120,10 +147,13 @@ local function burst(x, y, n, cols, spd)
 	end
 end
 
+-- centre of the priest sprite: slides out past the car's side as he leans
+local function gunner_pos()
+	return car.x + gunner.side*(car.side + PRIEST_REACH*gunner.out), car.y - 8
+end
+
 local function muzzle_pos()
-	local s = gunner.side
-	local sx = car.x + s*(car.w/2 + 9*gunner.out)
-	local sy = car.y - 8
+	local sx, sy = gunner_pos()
 	return sx + gunner.ax*8, sy + gunner.ay*8, sx, sy
 end
 
@@ -136,11 +166,18 @@ end
 
 local function spawn_zombie()
 	local side = rnd(1) < 0.5 and -1 or 1
+	local crawler = rnd(1) < min(CRAWLER_CHANCE + (wave - 1) * 0.05, 0.5)
+	local s = crawler and CRAWLER_SPR or ZOMBIE_SPR
+	local img = get_spr(s)
+	local w, h = img:width(), img:height()
+	local spd = 0.25 + rnd(0.25) + min(wave * 0.06, 0.45)
 	add(zombies, {
-		x = side < 0 and -zw/2 or SW+zw/2,
+		x = side < 0 and -w/2 or SW+w/2,
 		y = 10 + rnd(SH-20),
 		side = side,
-		spd = 0.25 + rnd(0.25) + min(wave * 0.06, 0.45),
+		spr = s, w = w, h = h,
+		spd = crawler and spd * CRAWLER_SPD or spd,
+		anim = crawler and CRAWLER_ANIM or 1,
 		hp = 2,
 		hit_t = 0,
 		wob = rnd(1),
@@ -537,25 +574,23 @@ local function draw_billboard(img, x, y, scale, fog, flip, tint)
 	return drawn
 end
 
-local function draw_gun()
-	local gx = SW/2 + cos(mz.bob) * 5
-	local gy = SH - 44 + abs(sin(mz.bob)) * 4 + (mz.flash > 0 and 4 or 0)
+local function draw_hands()
+	local sway = cos(mz.bob) * 5
+	-- bob and recoil only push them down, so the sleeves always run off the bottom edge
+	local top = SH - get_spr(GUN_SPR):height() + abs(sin(mz.bob)) * 4
+	local gun_x = SW/2 + HAND_SPREAD + sway
+	local gun_top = top + (mz.flash > 0 and 4 or 0)
 
-	-- black sleeve, white cuff, hand, pistol
-	rectfill(gx-11, gy+24, gx+11, SH, 0)
-	line(gx-11, gy+24, gx-11, SH, 5)
-	line(gx+11, gy+24, gx+11, SH, 5)
-	rectfill(gx-9, gy+20, gx+9, gy+23, 7)
-	circfill(gx, gy+12, 9, 15)
-	rectfill(gx-4, gy-18, gx+4, gy+6, 5)
-	rectfill(gx-2, gy-18, gx-1, gy+6, 6)
-	rectfill(gx-1, gy-20, gx+1, gy-18, 5)
-	rectfill(gx-2, gy+2, gx+2, gy+8, 15)
+	palt(0, false)
+	palt(TRANS_COL, true)
+	spr(CROSS_SPR, flr(SW/2 - HAND_SPREAD + sway) - CROSS_MID_X, flr(top))
+	spr(GUN_SPR, flr(gun_x) - GUN_MUZZLE_X, flr(gun_top))
+	palt()
 
 	if mz.flash > 0 then
-		circfill(gx, gy-22, 5 + mz.flash*2, 9)
-		circfill(gx, gy-22, 3 + mz.flash, 10)
-		circfill(gx, gy-22, 2, 7)
+		circfill(gun_x, gun_top-2, 5 + mz.flash*2, 9)
+		circfill(gun_x, gun_top-2, 3 + mz.flash, 10)
+		circfill(gun_x, gun_top-2, 2, 7)
 	end
 end
 
@@ -608,7 +643,15 @@ local function draw_maze()
 		end
 	end
 
-	draw_gun()
+	draw_hands()
+
+	-- crosshair: shots hit the nearest zombie in line with it
+	local cx, cy = SW/2, hz
+	line(cx-5, cy, cx-2, cy, 7)
+	line(cx+2, cy, cx+5, cy, 7)
+	line(cx, cy-5, cx, cy-2, 7)
+	line(cx, cy+2, cx, cy+5, 7)
+
 	if mz.hurt_t > 25 then
 		for i=0,3 do rect(i, i, SW-1-i, SH-1-i, 8) end
 	end
@@ -849,7 +892,7 @@ local function update_play()
 		local dead = b.life <= 0 or b.x < -10 or b.x > SW+10 or b.y < -10 or b.y > SH+10
 		if not dead then
 			for z in all(zombies) do
-				if abs(b.x - z.x) < zw/2 and abs(b.y - z.y) < zh/2 then
+				if abs(b.x - z.x) < z.w/2 and abs(b.y - z.y) < z.h/2 then
 					z.hp -= 1
 					z.hit_t = 4
 					z.x += b.vx * 0.6  -- knockback
@@ -864,8 +907,7 @@ local function update_play()
 	end
 
 	-- zombies shamble toward the car
-	local gx = car.x + gunner.side*(car.w/2 + 9*gunner.out)
-	local gy = car.y - 8
+	local gx, gy = gunner_pos()
 	for i=#zombies,1,-1 do
 		local z = zombies[i]
 		if z.hp <= 0 then
@@ -878,11 +920,11 @@ local function update_play()
 			local step = shamble(z)
 			z.x += dx * z.spd * step
 			z.y += dy * z.spd * step
-			z.wob += 0.05
+			z.wob += 0.05 * z.anim
 			z.hit_t = max(z.hit_t - 1, 0)
 
 			local touching_car = abs(z.x - car.x) < car.w/2 + 3 and abs(z.y - car.y) < car.h/2 + 3
-			local touching_gunner = gunner.out > 0.5 and abs(z.x - gx) < 7 and abs(z.y - gy) < 9
+			local touching_gunner = gunner.out > 0.5 and abs(z.x - gx) < pw/2 + 1 and abs(z.y - gy) < ph/2 + 1
 			if touching_car or touching_gunner then
 				hurt_car(z.x, z.y)
 				deli(zombies, i)
@@ -977,25 +1019,29 @@ local function draw_zombie(z)
 	-- the sprite faces left, so flip it when the car is off to the right
 	local flip = z.x < car.x
 	local frame = walk_phase(z)
-	draw_sprite(ZOMBIE_SPR + frame, z.x, z.y, zw, zh, flip, z.hit_t > 0 and 7 or nil)
+	draw_sprite((z.spr or ZOMBIE_SPR) + frame, z.x, z.y, z.w or zw, z.h or zh, flip, z.hit_t > 0 and 7 or nil)
 end
 
 local function draw_gunner()
 	if gunner.side == 0 or gunner.out <= 0 then return end
 	local s = gunner.side
-	local wx = car.x + s*(car.w/2 - 2)
-	local sx = car.x + s*(car.w/2 + 9*gunner.out)
-	local sy = car.y - 8
+	local wx = car.x + s*(car.side - 1)  -- start on the car's outline so there's no seam
+	local sx, sy = gunner_pos()
 
-	-- torso leaning out the window (black cassock, white collar)
-	rectfill(min(wx, sx-3*s), sy-1, max(wx, sx-3*s), sy+6, 0)
-	circfill(sx, sy, 4, 0)
-	circfill(sx, sy-5, 3, 15)
-	rectfill(sx-2, sy-2, sx+2, sy-2, 7)
+	-- black cassock bridging the window and the sprite, whose body trails off its bottom inner corner
+	local ex = sx - s*pw/2
+	local top = flr(sy - ph/2)
+	rectfill(min(wx, ex), top + ph - 3, max(wx, ex), top + ph - 1, 0)
+	-- the sprite faces right, so flip it out the left window
+	draw_sprite(PRIEST_SPR, sx, sy, pw, ph, s < 0)
 
 	if gunner.out >= 1 then
 		local mx, my = muzzle_pos()
 		line(sx, sy, mx, my, 6)
+		-- hands gripping the gun: one near the stock, one further up the barrel
+		for d in all(PRIEST_HANDS) do
+			pset(sx + gunner.ax*d, sy + gunner.ay*d, PRIEST_SKIN)
+		end
 		if gunner.flash > 0 then
 			circfill(mx, my, 2 + gunner.flash, 10)
 			circfill(mx, my, 1 + gunner.flash/2, 7)
