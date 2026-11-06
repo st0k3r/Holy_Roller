@@ -1120,22 +1120,59 @@ local function draw_bar(label, y, frac, col)
 	if frac > 0 then rectfill(bx, y, bx + bw * frac, y + 6, col) end
 end
 
+-- dashboard fuel gauge: a half dial with the needle sweeping from E on the left to F on the right
+local function draw_fuel_gauge()
+	local cx, cy, r = SW/2, SH - 6, 26
+	local function dir(frac)
+		local a = 0.45 - 0.4 * frac  -- angle in turns: 0.25 is straight up
+		return cos(a), sin(a)
+	end
+
+	-- the dial face, cut off just below the needle's hub
+	clip(cx - r, cy - r, r*2 + 1, r + 4)
+	circfill(cx, cy, r, 0)
+	circ(cx, cy, r, 6)
+	clip()
+	line(cx - r, cy + 3, cx + r, cy + 3, 6)
+
+	-- red zone up to the low fuel mark
+	for f=0,LOW_FUEL/MAX_FUEL,0.01 do
+		local dx, dy = dir(f)
+		pset(cx + dx*(r-3), cy + dy*(r-3), 8)
+		pset(cx + dx*(r-4), cy + dy*(r-4), 8)
+	end
+	for i=0,4 do
+		local dx, dy = dir(i/4)
+		line(cx + dx*(r-8), cy + dy*(r-8), cx + dx*(r-3), cy + dy*(r-3), 7)
+	end
+	print("E", cx - r + 3, cy - 4, 8)
+	print("F", cx + r - 8, cy - 4, 7)
+
+	-- pump icon, which doubles as the warning light: it blinks red when low
+	local lamp = 5
+	if fuel < LOW_FUEL then lamp = flr(time() * 4) % 2 == 0 and 8 or 2 end
+	rectfill(cx - 3, cy - 15, cx + 1, cy - 9, lamp)
+	rectfill(cx - 2, cy - 14, cx, cy - 13, 0)
+	line(cx - 4, cy - 8, cx + 2, cy - 8, lamp)
+	line(cx + 2, cy - 13, cx + 3, cy - 12, lamp)
+	line(cx + 3, cy - 12, cx + 3, cy - 10, lamp)
+
+	local dx, dy = dir(fuel / MAX_FUEL)
+	line(cx, cy, cx + dx*(r-7), cy + dy*(r-7), 9)
+	circfill(cx, cy, 2, 6)
+end
+
 local function draw_ammo()
-	local y = 26
-	local text, col
+	local y = 16
 	if mz then
-		draw_bar("AMMO", y, mz.ammo / mz.max_ammo, mz.ammo > 0 and 12 or 8)
-		text = mz.ammo > 0 and "PISTOL " .. mz.ammo .. "/" .. mz.max_ammo or "PISTOL EMPTY"
-		col = mz.ammo > 0 and 7 or 8
+		draw_bar("AMMO", y, mz.ammo / mz.max_ammo, 12)
 	elseif gunner.reload then
 		-- the bar refills as the reload runs
 		draw_bar("AMMO", y, 1 - gunner.reload / RELOAD_TIME, 10)
-		text, col = "RELOADING", flr(time() * 4) % 2 == 0 and 10 or 9
+		print("RELOADING", SW - 86, y + 10, flr(time() * 4) % 2 == 0 and 10 or 9)
 	else
 		draw_bar("AMMO", y, gunner.ammo / RIFLE_MAG, 12)
-		text, col = "RIFLE " .. gunner.ammo .. "/" .. RIFLE_MAG, 7
 	end
-	print(text, SW - 86, y + 10, col)
 end
 
 local function draw_hud()
@@ -1152,11 +1189,8 @@ local function draw_hud()
 	end
 
 	draw_bar("HP", 6, car.hp / car.max_hp, car.hp > 3 and 11 or 8)
-	-- low fuel blinks red
-	local low = fuel < LOW_FUEL
-	draw_bar("FUEL", 16, fuel / MAX_FUEL, low and (flr(time() * 4) % 2 == 0 and 8 or 2) or 9)
 	draw_ammo()
-	if low and not mz then print(fuel > 0 and "LOW FUEL" or "EMPTY", SW - 86, 46, 8) end
+	if not mz then draw_fuel_gauge() end
 end
 
 local function draw_banner()
