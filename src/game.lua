@@ -17,6 +17,9 @@ local BULLET_SPD = 7
 local GUN_RANGE = 260
 local RIFLE_MAG = 30     -- rounds per magazine
 local RELOAD_TIME = 90   -- frames to reload the rifle
+local SHELL_GRAV = 0.18  -- spent casings: fall speed gained per frame while airborne
+local MAX_SHELLS = 80    -- oldest casings on the road are swept away past this
+local SHELL_COL, SHELL_SHINE = 9, 10  -- brass, and its highlight
 
 local CRUISE_SPEED = 4
 local ACCEL = 0.05
@@ -68,6 +71,7 @@ local wiper             -- pivot (x, y), blade length, angle a; t is nil unless 
 local zw, zh            -- zombie sprite size
 local pw, ph            -- priest sprite size
 local zombies, road_zs, bullets, parts
+local shells            -- spent rifle casings: x, y on the ground, z height above it
 local scroll, speed, score, kills, spawn_t, road_t, shake
 local fuel, strandings  -- strandings counts trips into the maze; each one is harder
 local mz                -- maze state while on foot, nil while driving
@@ -110,6 +114,7 @@ function reset_game()
 	-- ammo: rounds in the magazine. reload: frames left, nil unless reloading. trig: Z held last frame
 	gunner = {side=0, out=0, cool=0, ax=0, ay=-1, flash=0, ammo=RIFLE_MAG, reload=nil, trig=false}
 	zombies, road_zs, bullets, parts = {}, {}, {}, {}
+	shells = {}
 	score, kills = 0, 0
 	spawn_t, road_t, shake = 0, 30, 0
 	wave, to_spawn = 1, 0
@@ -160,6 +165,57 @@ end
 local function muzzle_pos()
 	local sx, sy = gunner_pos()
 	return sx + gunner.ax*8, sy + gunner.ay*8, sx, sy
+end
+
+-- kick a spent casing out of the rifle's ejection port, off to the gun's right side
+local function eject_shell(sx, sy, ax, ay)
+	local px, py = -ay, ax  -- the gun's right, in screen space
+	local kick = 1.1 + rnd(0.6)
+	add(shells, {
+		x = sx + ax*4, y = sy + ay*4, z = 2,
+		vx = px*kick - ax*0.3 + rnd(0.4) - 0.2,
+		vy = py*kick - ay*0.3 + rnd(0.4) - 0.2,
+		vz = 1.4 + rnd(0.6),
+		a = rnd(1), spin = 0.08 + rnd(0.08),
+		bounces = 0,
+	})
+	if #shells > MAX_SHELLS then deli(shells, 1) end
+end
+
+local function update_shells()
+	for i=#shells,1,-1 do
+		local s = shells[i]
+		if s.vz then
+			-- airborne: tumble through an arc, bounce twice off the tarmac, then lie still
+			s.x += s.vx
+			s.y += s.vy
+			s.z += s.vz
+			s.vz -= SHELL_GRAV
+			s.a += s.spin
+			if s.z <= 0 then
+				s.z = 0
+				s.bounces += 1
+				if s.bounces > 2 then
+					s.vz = nil
+				else
+					s.vz = -s.vz * 0.4
+					s.vx *= 0.5
+					s.vy *= 0.5
+					s.spin *= 0.6
+				end
+			end
+		end
+		-- the road carries them away like everything else on it
+		s.y += speed
+		if s.y > SH + 4 then deli(shells, i) end
+	end
+end
+
+local function draw_shell(s)
+	local x, y = s.x, s.y - s.z
+	local dx, dy = cos(s.a) * 0.8, sin(s.a) * 0.8
+	line(x - dx, y - dy, x + dx, y + dy, SHELL_COL)
+	pset(x + dx, y + dy, SHELL_SHINE)
 end
 
 local function print_c(s, y, col)
@@ -231,6 +287,9 @@ local MZ_ZOMBIE_SPD = 0.022
 local MZ_AGGRO = 7       -- zombies notice you within this many tiles
 local MZ_ZOMBIE_SCALE = 0.75  -- zombie height relative to the trees
 local CAN_SCALE = 0.3
+local MZ_SHELL_LEN = 3   -- half-length of a pistol casing on screen; bigger than the rifle's since it's close up
+local MZ_SHELL_WIDTH = 3 -- and its thickness across
+local MZ_SHELL_GRAV = 0.35
 local DIRS = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}}
 
 -- each colour's darker neighbour, for fog
@@ -438,7 +497,8 @@ local function enter_maze()
 	strandings += 1
 
 	local m, size = gen_maze(n)
-	mz = {map=m, size=size, x=1.5, y=1.5, cool=0, flash=0, hurt_t=0, bob=0, zs={}, seen={}}
+	-- shells here are in screen space: they fly out of the pistol and fall off the bottom
+	mz = {map=m, size=size, x=1.5, y=1.5, cool=0, flash=0, hurt_t=0, bob=0, zs={}, seen={}, shells={}}
 	mz.a = m[1][2] == 0 and 0 or 0.75  -- face down the open path
 	set_dir()
 
@@ -467,7 +527,7 @@ local function enter_maze()
 	mz.ammo, mz.trig = mz.max_ammo, btn(4)
 
 	state = "maze"
-	road_zs, bullets, parts = {}, {}, {}
+	road_zs, bullets, parts, shells = {}, {}, {}, {}
 	shake = 0
 	show_banner("FIND A GAS CAN")
 end
@@ -479,6 +539,15 @@ local function leave_maze()
 	state = "play"
 	phase, phase_t = "drive", DRIVE_TIME
 	show_banner("TANK FULL")
+end
+
+-- where the hands sit on screen this frame: the pistol's centre line, its top edge, and the
+-- un-recoiled top that the crucifix uses. bob and recoil only push them down,
+-- so the sleeves always run off the bottom edge
+local function hand_pos()
+	local sway = cos(mz.bob) * 5
+	local top = SH - get_spr(GUN_SPR):height() + abs(sin(mz.bob)) * 4
+	return SW/2 + HAND_SPREAD + sway, top + (mz.flash > 0 and 4 or 0), top, sway
 end
 
 local function update_maze()
@@ -506,6 +575,13 @@ local function update_maze()
 	mz.trig = btn(4)
 	if pulled and mz.cool == 0 and mz.ammo > 0 then
 		mz.ammo -= 1
+		-- casing pops out of the top of the slide, up and off to the right
+		local gx, gtop = hand_pos()
+		add(mz.shells, {
+			x = gx + 3, y = gtop + 6,
+			vx = 1.5 + rnd(1.2), vy = -3 - rnd(1.5),
+			a = rnd(1), spin = 0.06 + rnd(0.06),
+		})
 		mz.cool, mz.flash = MZ_FIRE_DELAY, 3
 		local best, best_d = nil, cast(mz.dx, mz.dy)
 		local half = MZ_ZOMBIE_SCALE * SH * zw / zh / SW
@@ -518,6 +594,15 @@ local function update_maze()
 			best.hit_t = 4
 			move_body(best, mz.dx * 0.15, mz.dy * 0.15)  -- knockback
 		end
+	end
+
+	for i=#mz.shells,1,-1 do
+		local s = mz.shells[i]
+		s.x += s.vx
+		s.y += s.vy
+		s.vy += MZ_SHELL_GRAV
+		s.a += s.spin
+		if s.y > SH + 4 then deli(mz.shells, i) end
 	end
 
 	for i=#mz.zs,1,-1 do
@@ -590,12 +675,21 @@ local function draw_billboard(img, x, y, scale, fog, flip, tint)
 	return drawn
 end
 
+local function draw_maze_shells()
+	for s in all(mz.shells) do
+		local ux, uy = cos(s.a), sin(s.a)
+		local dx, dy = ux * MZ_SHELL_LEN, uy * MZ_SHELL_LEN
+		-- stack lines side by side across the casing's axis, so it stays wide at any spin angle
+		for w=-MZ_SHELL_WIDTH/2,MZ_SHELL_WIDTH/2,0.5 do
+			local ox, oy = -uy * w, ux * w
+			line(s.x - dx + ox, s.y - dy + oy, s.x + dx + ox, s.y + dy + oy, SHELL_COL)
+			pset(s.x + dx + ox, s.y + dy + oy, SHELL_SHINE)
+		end
+	end
+end
+
 local function draw_hands()
-	local sway = cos(mz.bob) * 5
-	-- bob and recoil only push them down, so the sleeves always run off the bottom edge
-	local top = SH - get_spr(GUN_SPR):height() + abs(sin(mz.bob)) * 4
-	local gun_x = SW/2 + HAND_SPREAD + sway
-	local gun_top = top + (mz.flash > 0 and 4 or 0)
+	local gun_x, gun_top, top, sway = hand_pos()
 
 	palt(0, false)
 	palt(TRANS_COL, true)
@@ -660,6 +754,7 @@ local function draw_maze()
 	end
 
 	draw_hands()
+	draw_maze_shells()
 
 	-- crosshair: shots hit the nearest zombie in line with it
 	local cx, cy = SW/2, hz
@@ -748,6 +843,7 @@ local function update_gunner()
 			gunner.cool = FIRE_DELAY
 			gunner.flash = 3
 			gunner.ammo -= 1
+			eject_shell(sx, sy, gunner.ax, gunner.ay)
 			if gunner.ammo == 0 then gunner.reload = RELOAD_TIME end
 		end
 	else
@@ -966,6 +1062,7 @@ local function update_play()
 
 	car.hit_t = max(car.hit_t - 1, 0)
 	update_wiper()
+	update_shells()
 end
 
 local function update_parts()
@@ -1211,10 +1308,17 @@ function _draw()
 
 		draw_world()
 		for p in all(parts) do pset(p.x, p.y, p.col) end
+		-- casings lying on the road go under everything; ones still in the air go over the car
+		for s in all(shells) do
+			if not s.vz then draw_shell(s) end
+		end
 		for z in all(road_zs) do draw_zombie(z) end
 		for z in all(zombies) do draw_zombie(z) end
 		draw_car()
 		draw_gunner()
+		for s in all(shells) do
+			if s.vz then draw_shell(s) end
+		end
 		draw_reload_bar()
 		for b in all(bullets) do
 			line(b.x, b.y, b.x - b.vx*0.6, b.y - b.vy*0.6, 10)
